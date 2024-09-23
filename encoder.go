@@ -7,16 +7,24 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/go-audio/audio"
 	"github.com/go-audio/riff"
 )
 
+type WriterAtSeeker interface {
+	io.Writer
+	io.WriterAt
+	io.Seeker
+}
+
 // Encoder encodes LPCM data into a wav containter.
 type Encoder struct {
-	w   io.WriteSeeker
-	buf *bytes.Buffer
+	mu      sync.Mutex
+	w       WriterAtSeeker
+	bufPool *sync.Pool
 
 	SampleRate int
 	BitDepth   int
@@ -36,15 +44,18 @@ type Encoder struct {
 	frames          int
 	pcmChunkStarted bool
 	pcmChunkSizePos int
+	pcmChunkPos     int64
 	wroteHeader     bool // true if we've written the header out
 }
 
 // NewEncoder creates a new encoder to create a new wav file.
 // Don't forget to add Frames to the encoder before writing.
-func NewEncoder(w io.WriteSeeker, sampleRate, bitDepth, numChans, audioFormat int) *Encoder {
+func NewEncoder(w WriterAtSeeker, sampleRate, bitDepth, numChans, audioFormat int) *Encoder {
 	return &Encoder{
-		w:              w,
-		buf:            bytes.NewBuffer(make([]byte, 0, bytesNumFromDuration(time.Minute, sampleRate, bitDepth)*numChans)),
+		w: w,
+		bufPool: &sync.Pool{New: func() interface{} {
+			return bytes.NewBuffer(make([]byte, 0, bytesNumFromDuration(time.Minute, sampleRate, bitDepth)*numChans))
+		}},
 		SampleRate:     sampleRate,
 		BitDepth:       bitDepth,
 		NumChans:       numChans,
@@ -64,48 +75,60 @@ func (e *Encoder) AddBE(src interface{}) error {
 	return binary.Write(e.w, binary.BigEndian, src)
 }
 
-func (e *Encoder) addBuffer(buf *audio.IntBuffer) error {
+func (e *Encoder) addBuffer(buf *audio.IntBuffer, pos *int64) (int64, error) {
 	if buf == nil {
-		return fmt.Errorf("can't add a nil buffer")
+		return 0, fmt.Errorf("can't add a nil buffer")
 	}
+
+	binaryBuf := e.bufPool.Get().(*bytes.Buffer)
+	defer e.bufPool.Put(binaryBuf)
 
 	frameCount := buf.NumFrames()
 	// performance tweak: setup a buffer so we don't do too many writes
 	var err error
+
+	bufferFrames := 0
 	for i := 0; i < frameCount; i++ {
 		for j := 0; j < buf.Format.NumChannels; j++ {
 			v := buf.Data[i*buf.Format.NumChannels+j]
 			switch e.BitDepth {
 			case 8:
-				if err = binary.Write(e.buf, binary.LittleEndian, uint8(v)); err != nil {
-					return err
+				if err = binary.Write(binaryBuf, binary.LittleEndian, uint8(v)); err != nil {
+					return 0, err
 				}
 			case 16:
-				if err = binary.Write(e.buf, binary.LittleEndian, int16(v)); err != nil {
-					return err
+				if err = binary.Write(binaryBuf, binary.LittleEndian, int16(v)); err != nil {
+					return 0, err
 				}
 			case 24:
-				if err = binary.Write(e.buf, binary.LittleEndian, audio.Int32toInt24LEBytes(int32(v))); err != nil {
-					return err
+				if err = binary.Write(binaryBuf, binary.LittleEndian, audio.Int32toInt24LEBytes(int32(v))); err != nil {
+					return 0, err
 				}
 			case 32:
-				if err = binary.Write(e.buf, binary.LittleEndian, int32(v)); err != nil {
-					return err
+				if err = binary.Write(binaryBuf, binary.LittleEndian, int32(v)); err != nil {
+					return 0, err
 				}
 			default:
-				return fmt.Errorf("can't add frames of bit size %d", e.BitDepth)
+				return 0, fmt.Errorf("can't add frames of bit size %d", e.BitDepth)
 			}
 		}
-		e.frames++
+		bufferFrames++
 	}
-	if n, err := e.w.Write(e.buf.Bytes()); err != nil {
-		e.WrittenBytes += n
-		return err
-	}
-	e.WrittenBytes += e.buf.Len()
-	e.buf.Reset()
 
-	return nil
+	var n int
+	if pos == nil {
+		n, err = e.w.Write(binaryBuf.Bytes())
+	} else {
+		n, err = e.w.WriteAt(binaryBuf.Bytes(), e.pcmChunkPos+*pos)
+	}
+
+	e.mu.Lock()
+	e.frames += bufferFrames
+	e.WrittenBytes += n
+	e.mu.Unlock()
+	binaryBuf.Reset()
+
+	return int64(n), nil
 }
 
 func (e *Encoder) writeHeader() error {
@@ -176,8 +199,27 @@ func (e *Encoder) writeHeader() error {
 // Write encodes and writes the passed buffer to the underlying writer.
 // Don't forget to Close() the encoder or the file won't be valid.
 func (e *Encoder) Write(buf *audio.IntBuffer) error {
+	if err := e.writeSetup(); err != nil {
+		return err
+	}
+
+	_, err := e.addBuffer(buf, nil)
+	return err
+}
+
+func (e *Encoder) WriteAt(buf *audio.IntBuffer, pos int64) (int64, error) {
+	if err := e.writeSetup(); err != nil {
+		return 0, err
+	}
+
+	return e.addBuffer(buf, &pos)
+}
+
+func (e *Encoder) writeSetup() error {
+	e.mu.Lock()
 	if !e.wroteHeader {
 		if err := e.writeHeader(); err != nil {
+			e.mu.Unlock()
 			return err
 		}
 	}
@@ -185,6 +227,7 @@ func (e *Encoder) Write(buf *audio.IntBuffer) error {
 	if !e.pcmChunkStarted {
 		// sound header
 		if err := e.AddLE(riff.DataFormatID); err != nil {
+			e.mu.Unlock()
 			return fmt.Errorf("error encoding sound header %w", err)
 		}
 		e.pcmChunkStarted = true
@@ -192,11 +235,15 @@ func (e *Encoder) Write(buf *audio.IntBuffer) error {
 		// write a temporary chunksize
 		e.pcmChunkSizePos = e.WrittenBytes
 		if err := e.AddLE(uint32(42)); err != nil {
+			e.mu.Unlock()
 			return fmt.Errorf("%w when writing wav data chunk size header", err)
 		}
-	}
 
-	return e.addBuffer(buf)
+		e.pcmChunkPos = int64(e.WrittenBytes)
+	}
+	e.mu.Unlock()
+
+	return nil
 }
 
 // WriteFrame writes a single frame of data to the underlying writer.
