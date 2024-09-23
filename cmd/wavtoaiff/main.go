@@ -11,9 +11,9 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/calebmcelroy/wav"
 	"github.com/go-audio/aiff"
 	"github.com/go-audio/audio"
-	"github.com/go-audio/wav"
 )
 
 var (

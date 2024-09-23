@@ -12,7 +12,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/go-audio/wav"
+	"github.com/calebmcelroy/wav"
 )
 
 var (

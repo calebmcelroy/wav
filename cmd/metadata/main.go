@@ -6,7 +6,7 @@ import (
 	"log"
 	"os"
 
-	"github.com/go-audio/wav"
+	"github.com/calebmcelroy/wav"
 )
 
 func main() {
