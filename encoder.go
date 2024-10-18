@@ -54,7 +54,7 @@ func NewEncoder(w WriterAtSeeker, sampleRate, bitDepth, numChans, audioFormat in
 	return &Encoder{
 		w: w,
 		bufPool: &sync.Pool{New: func() interface{} {
-			return bytes.NewBuffer(make([]byte, 0, bytesNumFromDuration(time.Minute, sampleRate, bitDepth)*numChans))
+			return bytes.NewBuffer(make([]byte, 0, bytesNumFromDuration(time.Second, sampleRate, bitDepth)*numChans))
 		}},
 		SampleRate:     sampleRate,
 		BitDepth:       bitDepth,
